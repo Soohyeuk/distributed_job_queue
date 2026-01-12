@@ -1,5 +1,6 @@
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <netinet/in.h>
@@ -22,6 +23,55 @@ queue<Job> jobs;
 unordered_map<int, Job> inflight;
 uint64_t job_id = 0;
 mutex job_mutex;
+
+void write_ahead_log(Job job, string type) {
+  ofstream log_file("write-ahead.log", ios::app);
+  if (type == "ADD") {
+    log_file << "ADD " << job.job_id << " " << job.job_text << "\n";
+  } else if (type == "DONE") {
+    log_file << "DONE " << job.job_id << "\n";
+  }
+  log_file.flush();
+  log_file.close();
+}
+
+void read_ahead_log() {
+  ifstream log_file("write-ahead.log");
+  string line;
+  unordered_map<uint64_t, Job> temp_jobs;
+
+  while (getline(log_file, line)) {
+    size_t sp = line.find(' ');
+    string cmd = (sp == string::npos) ? line : line.substr(0, sp);
+    string payload = (sp == string::npos) ? "" : line.substr(sp + 1);
+
+    if (cmd == "ADD") {
+      Job job;
+      size_t sp2 = payload.find(' ');
+      if (sp2 != string::npos) {
+        job.job_id = stoull(payload.substr(0, sp2));
+        job.job_text = payload.substr(sp2 + 1);
+        temp_jobs[job.job_id] = job;
+
+        if (job.job_id > job_id)
+          job_id = job.job_id;
+      }
+
+    } else if (cmd == "DONE") {
+      try {
+        uint64_t id = stoull(payload);
+        temp_jobs.erase(id);
+      } catch (...) {
+      }
+    }
+  }
+  log_file.close();
+
+  for (auto &pair : temp_jobs) {
+    jobs.push(pair.second);
+  }
+  cout << "Recovered " << temp_jobs.size() << " jobs from WAL." << endl;
+}
 
 void handle_inflight_request(int client_fd) {
   // we want to ensure that if a job is incomplete, but the client disconnects
@@ -68,26 +118,24 @@ void handle_client(int client_fd) {
       cout << cmd << " " << payload << endl;
       lock_guard<mutex> lock(job_mutex);
       jobs.push({++job_id, payload});
+      write_ahead_log(jobs.back(), "ADD");
 
     } else if (cmd == "REQUEST") {
-      uint64_t id;
-      string value;
+      string out;
 
       // mutex should start and end in this bracket
       {
         lock_guard<mutex> lock(job_mutex);
-        if (jobs.empty())
-          value = "EMPTY";
-        else {
-          id = jobs.front().job_id;
-          value = jobs.front().job_text;
+        if (jobs.empty()) {
+          out = "EMPTY\n";
+        } else {
+          uint64_t id = jobs.front().job_id;
+          string value = jobs.front().job_text;
           inflight[client_fd] = jobs.front();
           jobs.pop();
+          out = to_string(id) + " " + value + "\n";
         }
       }
-
-      // send the result back
-      string out = to_string(id) + " " + value + "\n";
       if (::send(client_fd, out.c_str(), out.size(), 0) == -1) {
         handle_inflight_request(client_fd);
         ::close(client_fd);
@@ -98,6 +146,43 @@ void handle_client(int client_fd) {
       handle_inflight_request(client_fd);
       ::close(client_fd);
       break;
+
+    } else if (cmd == "ACK") {
+      uint64_t id = 0;
+      try {
+        id = stoull(payload);
+      } catch (...) {
+        cerr << "Invalid ACK format" << endl;
+        continue;
+      }
+
+      lock_guard<mutex> lock(job_mutex);
+      auto it = inflight.find(client_fd);
+      if (it != inflight.end() && it->second.job_id == id) {
+        cout << "Job " << id << " ACKed by client " << client_fd << endl;
+        inflight.erase(it);
+      } else {
+        cerr << "received ACK for unknown job or client " << client_fd << endl;
+      }
+      write_ahead_log({id, ""}, "DONE");
+
+    } else if (cmd == "FAIL") {
+      uint64_t id = 0;
+      try {
+        id = stoull(payload);
+      } catch (...) {
+        cerr << "Invalid FAIL format" << endl;
+        continue;
+      }
+
+      lock_guard<mutex> lock(job_mutex);
+      auto it = inflight.find(client_fd);
+      if (it != inflight.end() && it->second.job_id == id) {
+        cout << "Job " << id << " FAILED by client " << client_fd
+             << ", requeuing." << endl;
+        jobs.push(it->second);
+        inflight.erase(it);
+      }
 
     } else {
       cerr << "Invalid command " << line << endl;
@@ -139,6 +224,7 @@ int main() {
   }
 
   cout << "TCP Server Opened in localhost " << PORT << endl;
+  read_ahead_log();
 
   while (true) {
     socklen_t len_client = sizeof(client_struct);

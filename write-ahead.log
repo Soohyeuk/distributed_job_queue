@@ -1,0 +1,8 @@
+ADD 1 a
+ADD 2 b
+ADD 3 c
+ADD 4 d
+DONE 4
+DONE 3
+DONE 2
+DONE 1

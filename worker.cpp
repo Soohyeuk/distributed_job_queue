@@ -73,7 +73,20 @@ int main() {
 
     cout << "Got job: " << response << endl;
 
-    if (!send_all(sock, "ACK\n"))
+    // Parse job ID from "JOB <id> <payload>"
+    // The server sends: "<id> <value>"
+    size_t first_space = response.find(' ');
+    if (first_space == string::npos) {
+      cerr << "Error: Malformed job response" << endl;
+      continue;
+    }
+    string id_str = response.substr(0, first_space);
+
+    // Simulate work
+    this_thread::sleep_for(chrono::seconds(1));
+
+    string ack_msg = "ACK " + id_str + "\n";
+    if (!send_all(sock, ack_msg))
       break;
   }
 
